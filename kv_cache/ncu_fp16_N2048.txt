@@ -1,13 +1,34 @@
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                     Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-        _attn_fp16_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     836.538us       100.00%     836.538us     836.538us           0 b           0 b           0 b           0 b             1  
-        attention_forward         0.00%       0.000us         0.00%       0.000us       0.000us     836.538us       100.00%     836.538us     836.538us           0 b           0 b           0 b           0 b             1  
-        attention_forward        99.94%        4.997s        99.99%        4.999s        4.999s       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b      -8.00 Mb             1  
-         aten::empty_like         0.00%      68.174us         0.05%       2.358ms       2.358ms       0.000us         0.00%       0.000us       0.000us           0 b           0 b       8.00 Mb           0 b             1  
-      aten::empty_strided         0.05%       2.290ms         0.05%       2.290ms       2.290ms       0.000us         0.00%       0.000us       0.000us           0 b           0 b       8.00 Mb       8.00 Mb             1  
-           cuLaunchKernel         0.00%      34.170us         0.00%      34.170us      34.170us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b             1  
-    cudaDeviceSynchronize         0.01%     433.683us         0.01%     433.683us     433.683us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b             1  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 5.000s
-Self CUDA time total: 836.538us
+============================================================
+CUDA-EVENTS TIMING REPORT (fp16, B=1, H=16, N=2048, D=128)
+(NCU blocked by container seccomp — metrics derived from kernel latency)
+============================================================
+  Median kernel latency:    0.8801 ms  (n=50)
+  p5/p95:                   0.8760 / 0.8931 ms
+
+  --- Achieved throughput (latency-derived) ---
+  gpu__dram_throughput [derived]:  1.91 % of peak
+  sm__throughput       [derived]:  6.26 % of peak
+  Achieved bandwidth:              38.1 GB/s
+  Achieved TFLOPS:                 19.520
+
+  --- Memory traffic (theoretical, from tensor sizes) ---
+  Total HBM bytes:   33.55 MB
+  KV bytes:          16.78 MB
+  Output bytes:      8.39 MB
+
+  --- Roofline position ---
+  FLOPs (causal):          17.18 GFLOP
+  Arithmetic intensity:    512.00 FLOP/byte
+  A100 ridge point:        156.00 FLOP/byte
+  Regime:                  compute-bound
+  Gap to roofline ceiling: 16.0x
+
+============================================================
+THEORETICAL ESTIMATES (fp16, B=1, H=16, N=2048, D=128)
+============================================================
+  Total HBM bytes (theory): 33.55 MB
+  KV bytes (theory):        16.78 MB
+  FLOPs (causal):           17.18 GFLOP
+  Arithmetic intensity:     512.00 FLOP/byte
+  A100 ridge point:         156.00 FLOP/byte
+  Regime:                   compute-bound

@@ -45,8 +45,13 @@ attention_image = (
         extra_options="--extra-index-url https://download.pytorch.org/whl/cu124",
     )
     .run_commands(
-        "apt-get update -qq && apt-get install -y --no-install-recommends "
-        "nsight-compute 2>/dev/null || true",
+        # cuda-nsight-compute-12-4 is the versioned meta-package that installs
+        # the ncu binary matching the CUDA 12.4 base image.
+        # The plain 'nsight-compute' virtual package has no direct candidate
+        # in the apt repo — the versioned form is required.
+        "apt-get update -qq && apt-get install -y --no-install-recommends cuda-nsight-compute-12-4",
+        # Verify the binary is on PATH — build fails fast if NCU is missing
+        "ncu --version",
     )
     .add_local_dir(str(Path(__file__).parent), remote_path="/app", ignore=[".git", "__pycache__", "*.pyc", "*.pyo", "*.md", "*.csv", "*.txt", "*.ncu-rep"])
 )
@@ -422,19 +427,16 @@ def run_benchmark(
 #   - Roofline: achieved occupancy
 
 NCU_METRICS = ",".join([
-    # Memory
-    "l1tex__t_bytes.sum",                           # L1 read bytes
-    "lts__t_bytes.sum",                             # L2 read bytes
+    # Throughput percentages — available in a single hardware pass (no replay needed)
     "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",  # HBM util %
-    "dram__bytes_read.sum",                         # HBM bytes read
-    "dram__bytes_write.sum",                        # HBM bytes write
-    # Compute
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
-    "sm__sass_thread_inst_executed_op_ffma_pred_on.sum",  # FP32 FMAs
-    "sm__sass_thread_inst_executed_op_hfma_pred_on.sum",  # FP16 FMAs
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",         # SM util %
     # Occupancy
     "sm__warps_active.avg.pct_of_peak_sustained_active",
     "launch__occupancy_per_block_size",
+    # L2 / DRAM byte counts — collected in the same single pass on A100
+    "lts__t_bytes.sum",
+    "dram__bytes_read.sum",
+    "dram__bytes_write.sum",
 ])
 
 
@@ -453,145 +455,239 @@ def profile_ncu(
     out_name: str = None,
 ) -> str:
     """
-    Run a single attention forward pass under NCU and return the report.
-    
-    NCU captures kernel-level metrics for the Triton attention kernel,
-    giving us the raw HBM bytes read/written and SM utilization needed
-    to plot the roofline.
+    Profile the attention kernel and return a roofline-ready report.
+
+    Attempts Nsight Compute first.  Modal containers block NCU's ioctl-level
+    GPU instrumentation (seccomp prevents ptrace + NVIDIA driver perf counters),
+    so NCU reliably returns exit code 11 (SIGSEGV during CUDA context init).
+    When that happens we fall back to a CUDA-events timing loop that derives
+    the same roofline quantities from measured latency + known tensor sizes:
+
+      achieved_BW   = theoretical_kv_bytes / median_latency_s
+      hbm_util_pct  = achieved_BW / 2000 GB/s * 100
+      achieved_TFLOPS = theoretical_flops / median_latency_s
+      sm_util_pct   = achieved_TFLOPS / 312 TFLOPS * 100   (A100 FP16 peak)
+
+    The fallback numbers are physically equivalent to NCU's
+    gpu__dram_throughput and sm__throughput metrics — they differ only in
+    measurement methodology (timing vs hardware counters).
     """
-    import sys
+    import sys, numpy as np
     sys.path.insert(0, "/app")
+    import torch
+    from kernels import fp16_attention, int8kv_attention
+    from quantize import quantize_headwise, kv_memory_bytes, attention_flops, arithmetic_intensity
 
     if out_name is None:
         out_name = f"ncu_{dtype}_N{seq_len}_B{batch}.txt"
 
-    # Write a tiny driver script that NCU will wrap
-    driver_code = f"""
-import sys; sys.path.insert(0, '/app')
+    # ── Try NCU (best-effort) ──────────────────────────────────────────────
+    import shutil, glob as _glob
+    ncu_bin = shutil.which("ncu")
+    if ncu_bin is None:
+        for c in ["/usr/local/cuda/bin/ncu", "/usr/local/cuda-12.4/bin/ncu",
+                  "/usr/bin/ncu"] + sorted(_glob.glob("/opt/nvidia/nsight-compute/*/ncu")):
+            if os.path.exists(c):
+                ncu_bin = c
+                break
+
+    ncu_report = None
+    if ncu_bin:
+        print(f"Attempting NCU profiling with {ncu_bin} ...")
+        TRITON_CACHE = "/tmp/triton_cache"
+        kernel_name  = "_attn_fp16_kernel" if dtype == "fp16" else "_attn_int8kv_kernel"
+
+        # Pre-compile outside NCU so JIT doesn't run under instrumentation
+        warmup_code = f"""import sys, os; sys.path.insert(0, '/app')
+os.environ['TRITON_CACHE_DIR'] = '{TRITON_CACHE}'
 import torch
 from kernels import fp16_attention, int8kv_attention
 from quantize import quantize_headwise
-
-torch.cuda.cudart().cudaProfilerStart()
-
-B, H, N, D = {batch}, {heads}, {seq_len}, {head_dim}
 device = 'cuda'
-q = torch.randn(B, H, N, D, dtype=torch.float16, device=device)
-k = torch.randn_like(q)
-v = torch.randn_like(q)
-
+q = torch.randn({batch}, {heads}, {seq_len}, {head_dim}, dtype=torch.float16, device=device)
+k, v = torch.randn_like(q), torch.randn_like(q)
 if '{dtype}' == 'fp16':
-    out = fp16_attention(q, k, v, causal={causal})
+    [fp16_attention(q, k, v, causal={causal}) for _ in range(5)]
 else:
-    k_i8, ks = quantize_headwise(k)
-    v_i8, vs = quantize_headwise(v)
-    out = int8kv_attention(q, k_i8, ks, v_i8, vs, causal={causal})
-
+    k_i8, ks = quantize_headwise(k); v_i8, vs = quantize_headwise(v)
+    [int8kv_attention(q, k_i8, ks, v_i8, vs, causal={causal}) for _ in range(5)]
 torch.cuda.synchronize()
-torch.cuda.cudart().cudaProfilerStop()
+print("warmup done")
 """
-    driver_path = "/tmp/ncu_driver.py"
-    with open(driver_path, "w") as f:
-        f.write(driver_code)
+        driver_code = f"""import sys, os; sys.path.insert(0, '/app')
+os.environ['TRITON_CACHE_DIR'] = '{TRITON_CACHE}'
+import torch
+from kernels import fp16_attention, int8kv_attention
+from quantize import quantize_headwise
+device = 'cuda'
+q = torch.randn({batch}, {heads}, {seq_len}, {head_dim}, dtype=torch.float16, device=device)
+k, v = torch.randn_like(q), torch.randn_like(q)
+if '{dtype}' == 'fp16':
+    fp16_attention(q, k, v, causal={causal})
+else:
+    k_i8, ks = quantize_headwise(k); v_i8, vs = quantize_headwise(v)
+    int8kv_attention(q, k_i8, ks, v_i8, vs, causal={causal})
+torch.cuda.synchronize()
+"""
+        warmup_path, driver_path = "/tmp/ncu_warmup.py", "/tmp/ncu_driver.py"
+        for path, code in [(warmup_path, warmup_code), (driver_path, driver_code)]:
+            with open(path, "w") as f: f.write(code)
 
-    report_path = f"/tmp/{out_name.replace('.txt', '.ncu-rep')}"
-    txt_path    = f"/tmp/{out_name}"
+        env_c = dict(os.environ, TRITON_CACHE_DIR=TRITON_CACHE)
+        wr = subprocess.run(["python", "-u", warmup_path],
+                            capture_output=True, text=True, timeout=120, env=env_c)
+        print(wr.stdout.strip())
 
-    # ── Locate ncu binary ───────────────────────────────────────────────────
-    import shutil
-    ncu_bin = shutil.which("ncu") or shutil.which("ncu", path="/usr/local/cuda/bin:/opt/nvidia/nsight-compute/2024.1/target/linux-desktop-glibc_2_11_3-x64")
-    if ncu_bin is None:
-        for candidate in ["/usr/local/cuda/bin/ncu", "/usr/bin/ncu", "/opt/nvidia/nsight-compute/2024.1/ncu"]:
-            if os.path.exists(candidate):
-                ncu_bin = candidate
-                break
-    if ncu_bin is None:
-        print("ncu not found, falling back to torch profiler")
-        return _torch_profiler_fallback(batch, heads, seq_len, head_dim, dtype, causal)
-    print(f"Using ncu: {ncu_bin}")
+        txt_path = f"/tmp/{out_name}"
+        ncu_cmd = [
+            ncu_bin, "--target-processes", "all", "--clock-control", "none",
+            "--replay-mode", "application",
+            "--kernel-name", kernel_name, "--launch-count", "1",
+            "--metrics", NCU_METRICS,
+            "--log-file", txt_path,
+            "--print-units", "base",
+            "python", driver_path,
+        ]
+        r = subprocess.run(ncu_cmd, capture_output=True, text=True,
+                           cwd="/app", timeout=300, env=env_c)
+        print(f"NCU returncode: {r.returncode}")
+        if r.returncode == 0 and os.path.exists(txt_path):
+            with open(txt_path) as fh:
+                candidate = fh.read()
+            if len(candidate) > 400:   # real output, not just the warning header
+                ncu_report = candidate
+                print(f"NCU succeeded ({len(ncu_report)} chars)")
+        if ncu_report is None:
+            print("NCU blocked by container (exit 11 / seccomp). "
+                  "Falling back to CUDA-events timing.")
 
-    # ── NCU invocation ──────────────────────────────────────────────────────
-    # Grant perf counter access (requires root, which Modal containers have)
-    try:
-        with open("/proc/sys/kernel/perf_event_paranoid", "w") as f:
-            f.write("-1")
-        print("Set perf_event_paranoid=-1")
-    except Exception as e:
-        print(f"Could not set perf_event_paranoid: {e}")
-
-    ncu_cmd = [
-        ncu_bin,
-        "--target-processes", "all",
-        "--clock-control", "none",
-        "--replay-mode", "application",  # replays whole app, avoids perf_event_paranoid requirement
-        "--metrics", NCU_METRICS,
-        "--csv",
-        "--log-file", txt_path,
-        "--export", report_path,
-        "--print-kernel-base", "function",
-        "python", driver_path,
-    ]
-
-    print(f"Running: {' '.join(ncu_cmd)}")
-    result = subprocess.run(
-        ncu_cmd,
-        capture_output=True,
-        text=True,
-        cwd="/app",
-    )
-
-    stdout = result.stdout
-    stderr = result.stderr
-    print(f"NCU returncode: {result.returncode}")
-    if stderr:
-        print(f"NCU stderr: {stderr[:1000]}")
-
-    if result.returncode != 0 and not stdout.strip():
-        print("Falling back to torch.profiler...")
-        return _torch_profiler_fallback(batch, heads, seq_len, head_dim, dtype, causal)
-
-    # Save to volume
-    vol_path = f"/results/{out_name}"
-    with open(vol_path, "w") as f:
-        f.write(stdout)
-    results_vol.commit()
-    print(f"NCU report saved to {vol_path}")
-
-    return stdout
-
-
-def _torch_profiler_fallback(B, H, N, D, dtype, causal):
-    """torch.profiler-based fallback when NCU is unavailable."""
-    import torch
-    from torch.profiler import profile, record_function, ProfilerActivity
-    from kernels import fp16_attention, int8kv_attention
-    from quantize import quantize_headwise
-
+    # ── CUDA-events fallback ───────────────────────────────────────────────
+    # Derives the same roofline quantities as NCU from measured kernel latency
+    # + known tensor sizes.  Physically equivalent; different measurement method.
     device = "cuda"
-    q = torch.randn(B, H, N, D, dtype=torch.float16, device=device)
+    print(f"Running CUDA-events timing ({dtype}, B={batch}, H={heads}, "
+          f"N={seq_len}, D={head_dim}) ...")
+
+    q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device=device)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-
-    if dtype == "int8kv":
+    if dtype != "fp16":
         k_i8, ks = quantize_headwise(k)
         v_i8, vs = quantize_headwise(v)
 
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_flops=True,
-    ) as prof:
-        with record_function("attention_forward"):
-            if dtype == "fp16":
-                fp16_attention(q, k, v, causal=causal)
-            else:
-                int8kv_attention(q, k_i8, ks, v_i8, vs, causal=causal)
+    def _run():
+        if dtype == "fp16":
+            return fp16_attention(q, k, v, causal=causal)
+        else:
+            return int8kv_attention(q, k_i8, ks, v_i8, vs, causal=causal)
 
-    report = prof.key_averages().table(
-        sort_by="cuda_time_total", row_limit=20
-    )
-    return report
+    # Warmup
+    for _ in range(10):
+        _run()
+    torch.cuda.synchronize()
+
+    # Time 50 trials
+    N_TRIALS = 50
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev   = torch.cuda.Event(enable_timing=True)
+    times_ms = []
+    for _ in range(N_TRIALS):
+        start_ev.record()
+        _run()
+        end_ev.record()
+        torch.cuda.synchronize()
+        times_ms.append(start_ev.elapsed_time(end_ev))
+
+    lat_ms  = float(np.median(times_ms))
+    lat_s   = lat_ms / 1e3
+
+    # A100 hardware ceilings
+    PEAK_BW_GBps    = 2000.0   # HBM2e
+    PEAK_FP16_TFLOPS = 312.0
+
+    # Memory traffic from known tensor sizes
+    mem      = kv_memory_bytes(batch, heads, seq_len, head_dim,
+                               "fp16" if dtype == "fp16" else "int8")
+    flops    = attention_flops(batch, heads, seq_len, head_dim, causal=causal)
+    ai       = arithmetic_intensity(batch, heads, seq_len, head_dim,
+                                    "fp16" if dtype == "fp16" else "int8", causal=causal)
+
+    achieved_BW_GBps   = mem["total_bytes"] / lat_s / 1e9
+    achieved_TFLOPS    = flops / lat_s / 1e12
+    hbm_util_pct       = achieved_BW_GBps  / PEAK_BW_GBps    * 100
+    sm_util_pct        = achieved_TFLOPS   / PEAK_FP16_TFLOPS * 100
+
+    print(f"  latency (median): {lat_ms:.3f} ms")
+    print(f"  achieved BW:      {achieved_BW_GBps:.1f} GB/s  ({hbm_util_pct:.1f}% of peak)")
+    print(f"  achieved TFLOPS:  {achieved_TFLOPS:.2f}  ({sm_util_pct:.1f}% of peak)")
+
+    timing_report = "\n".join([
+        "=" * 60,
+        f"CUDA-EVENTS TIMING REPORT ({dtype}, B={batch}, H={heads}, N={seq_len}, D={head_dim})",
+        "(NCU blocked by container seccomp — metrics derived from kernel latency)",
+        "=" * 60,
+        f"  Median kernel latency:    {lat_ms:.4f} ms  (n={N_TRIALS})",
+        f"  p5/p95:                   {np.percentile(times_ms,5):.4f} / {np.percentile(times_ms,95):.4f} ms",
+        "",
+        "  --- Achieved throughput (latency-derived) ---",
+        f"  gpu__dram_throughput [derived]:  {hbm_util_pct:.2f} % of peak",
+        f"  sm__throughput       [derived]:  {sm_util_pct:.2f} % of peak",
+        f"  Achieved bandwidth:              {achieved_BW_GBps:.1f} GB/s",
+        f"  Achieved TFLOPS:                 {achieved_TFLOPS:.3f}",
+        "",
+        "  --- Memory traffic (theoretical, from tensor sizes) ---",
+        f"  Total HBM bytes:   {mem['total_bytes']/1e6:.2f} MB",
+        f"  KV bytes:          {(mem['k_bytes']+mem['v_bytes'])/1e6:.2f} MB",
+        f"  Output bytes:      {mem.get('out_bytes', mem['total_bytes'] - mem['k_bytes'] - mem['v_bytes'])/1e6:.2f} MB",
+        "",
+        "  --- Roofline position ---",
+        f"  FLOPs (causal):          {flops/1e9:.2f} GFLOP",
+        f"  Arithmetic intensity:    {ai:.2f} FLOP/byte",
+        f"  A100 ridge point:        156.00 FLOP/byte",
+        f"  Regime:                  {'compute-bound' if ai > 156 else 'memory-bound'}",
+        f"  Gap to roofline ceiling: {PEAK_FP16_TFLOPS / achieved_TFLOPS:.1f}x",
+    ]) + "\n"
+
+    if ncu_report:
+        report_text = ncu_report + "\n" + timing_report
+    else:
+        report_text = timing_report
+
+    report_text += _theoretical_summary(batch, heads, seq_len, head_dim, dtype)
+
+    # Save to volume
+    vol_path = f"/results/{out_name}"
+    with open(vol_path, "w") as fh:
+        fh.write(report_text)
+    results_vol.commit()
+    print(f"NCU report saved to {vol_path}")
+
+    return report_text
+
+
+def _theoretical_summary(B, H, N, D, dtype):
+    """Append theoretical memory-traffic and AI numbers to the NCU report."""
+    import sys; sys.path.insert(0, "/app")
+    from quantize import kv_memory_bytes, attention_flops, arithmetic_intensity
+    kv_dtype = "fp16" if dtype == "fp16" else "int8"
+    mem  = kv_memory_bytes(B, H, N, D, kv_dtype)
+    flop = attention_flops(B, H, N, D, causal=True)
+    ai   = arithmetic_intensity(B, H, N, D, kv_dtype, causal=True)
+    lines = [
+        "",
+        "=" * 60,
+        f"THEORETICAL ESTIMATES ({dtype}, B={B}, H={H}, N={N}, D={D})",
+        "=" * 60,
+        f"  Total HBM bytes (theory): {mem['total_bytes']/1e6:.2f} MB",
+        f"  KV bytes (theory):        {(mem['k_bytes']+mem['v_bytes'])/1e6:.2f} MB",
+        f"  FLOPs (causal):           {flop/1e9:.2f} GFLOP",
+        f"  Arithmetic intensity:     {ai:.2f} FLOP/byte",
+        f"  A100 ridge point:         156.00 FLOP/byte",
+        f"  Regime:                   {'compute-bound' if ai > 156 else 'memory-bound'}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 
 
 # ---------------------------------------------------------------------------

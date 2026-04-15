@@ -148,10 +148,11 @@ def profile_model(model, tokenizer, cfg: ProfileConfig) -> list[dict]:
     def _pct(v):
         return round(v / total_ms * 100, 2) if total_ms > 0 else 0.0
 
-    print(f"  Total: {total_ms:.2f} ms | "
-          f"Attn: {attn_ms:.2f} ms ({_pct(attn_ms)}%) | "
-          f"FFN: {ffn_ms:.2f} ms ({_pct(ffn_ms)}%) | "
-          f"Other: {other_ms:.2f} ms ({_pct(other_ms)}%)")
+    print("  Timing breakdown (median over trials, per forward pass):")
+    print(f"    Total forward latency: {total_ms:.2f} ms")
+    print(f"    Attention modules:     {attn_ms:.2f} ms ({_pct(attn_ms)}% of total)")
+    print(f"    FFN modules:           {ffn_ms:.2f} ms ({_pct(ffn_ms)}% of total)")
+    print(f"    Other runtime:         {other_ms:.2f} ms ({_pct(other_ms)}% of total)")
 
     base = dict(prune_ratio=cfg.prune_ratio, batch=cfg.batch_size,
                 seq_len=cfg.seq_len)
@@ -376,7 +377,9 @@ def profile_sweep(
 
         for batch in batch_sizes:
             for seq_len in seq_lens:
-                print(f"\n  Config: batch={batch}, seq_len={seq_len}")
+                total_tokens = batch * seq_len
+                print(f"\n  Config: batch={batch}, seq_len={seq_len} "
+                      f"(tokens/forward={total_tokens})")
                 cfg = ProfileConfig(batch_size=batch, seq_len=seq_len,
                                     prune_ratio=label)
                 try:

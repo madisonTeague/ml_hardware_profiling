@@ -183,7 +183,17 @@ def _make_pruned_linear(old: nn.Linear, keep_idx: torch.Tensor,
 
 
 def prune_ffn_layer(layer, keep_indices: torch.Tensor):
-    """Replace gate/up/down projections in-place with pruned versions."""
+    """Replace gate/up/down projections in-place with pruned versions.
+
+    Qwen FFN path is:
+        hidden -> gate_proj/up_proj -> elementwise(SwiGLU) -> down_proj -> hidden
+
+    Structured pruning removes the same intermediate neuron indices from:
+    - rows of gate_proj
+    - rows of up_proj
+    - columns of down_proj
+    so tensor dimensions stay consistent for the fused FFN block.
+    """
     mlp = layer.mlp
     device_idx = keep_indices.to(mlp.gate_proj.weight.device)
 
@@ -347,6 +357,7 @@ def prune_model(model_name: str, prune_ratio: float, output_dir: str,
     print(f"PRUNING  model={model_name}  ratio={prune_ratio}")
     print(f"{'='*60}")
 
+    # 1) Load baseline model/tokenizer checkpoint.
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name, trust_remote_code=True,
@@ -360,23 +371,27 @@ def prune_model(model_name: str, prune_ratio: float, output_dir: str,
     print(f"  intermediate_size: {orig_inter} -> {n_keep}  "
           f"(removing {orig_inter - n_keep} neurons per layer)")
 
+    # 2) Score each FFN intermediate neuron (training-free magnitude criterion).
     use_triton = HAS_TRITON and torch.cuda.is_available()
     print(f"  Importance backend: {'Triton' if use_triton else 'PyTorch'}")
     print("  Computing neuron importance scores ...")
     importance = compute_neuron_importance(model, use_triton=use_triton)
     _wandb_log_importance(importance, prune_ratio)
 
+    # 3) Physically shrink FFN projection matrices in every decoder block.
     print("  Pruning FFN layers ...")
     for idx, layer in enumerate(_iter_decoder_layers(model)):
         keep = _select_keep_indices(importance[idx], prune_ratio)
         prune_ffn_layer(layer, keep)
 
+    # 4) Log matrix-shape changes for hardware analysis and update config.
     gemm_rows = log_gemm_shapes(model, prune_ratio)
     _wandb_log_gemm(gemm_rows, prune_ratio)
 
     model.config.intermediate_size = n_keep
     _wandb_log_prune_summary(model, prune_ratio, orig_inter)
 
+    # 5) Save a standard HF checkpoint so later profiling can reload directly.
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     print(f"  Saving pruned model to {out} ...")

@@ -151,6 +151,59 @@ def plot_latency(df, output_dir):
     print(f"Saved {out}")
 
 
+def plot_memory(df, output_dir):
+    """Peak memory (total row) comparison FP16 vs W4A8."""
+    if "mem_mb" not in df.columns:
+        print("No mem_mb column in CSV — skipping memory plot")
+        return
+    Path(output_dir).mkdir(exist_ok=True)
+    df_total = df[df["layer_type"] == "total"].copy()
+
+    pivot = df_total.pivot_table(index=["batch", "seq_len"],
+                                 columns="dtype", values="mem_mb")
+
+    labels = [f"N={n}" for (_, n) in pivot.index]
+    x = np.arange(len(labels))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(12, len(labels) * 1.4), 6.5))
+    bar_colors = {"fp16": "#4C72B0", "w4a8": "#DD8452"}
+    dtypes = sorted(pivot.columns)
+    for i, dt in enumerate(dtypes):
+        vals = pivot[dt].values / 1e3
+        ax.bar(x + (i - 0.5) * width, vals, width,
+               label=dt.upper(), color=bar_colors.get(dt, "gray"), alpha=0.85)
+
+    if "fp16" in pivot.columns and "w4a8" in pivot.columns:
+        for idx in range(len(x)):
+            fp16_val = pivot["fp16"].iloc[idx]
+            w4a8_val = pivot["w4a8"].iloc[idx]
+            if pd.notna(fp16_val) and pd.notna(w4a8_val) and fp16_val > 0:
+                change = (w4a8_val / fp16_val - 1) * 100
+                taller = max(fp16_val, w4a8_val) / 1e3
+                color = "#2a7f2a" if change < -0.5 else ("#b22222" if change > 0.5 else "gray")
+                sign = "+" if change > 0 else ""
+                ax.text(x[idx], taller + taller * 0.02,
+                        f"{sign}{change:.1f}%", ha="center", va="bottom",
+                        fontsize=7, fontweight="bold", color=color)
+
+    _add_batch_dividers(ax, pivot.index, x)
+
+    ax.set_ylabel("Peak Memory (GB)")
+    ax.set_xlabel("Sequence Length (tokens)")
+    ax.set_title("Peak GPU Memory: FP16 vs W4A8 (Qwen3-8B, A100-80GB)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    fig.subplots_adjust(bottom=0.18)
+
+    out = Path(output_dir) / "exp2_memory.png"
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {out}")
+
+
 def print_summary(df):
     print("\n" + "=" * 70)
     print("LAYER-WISE RUNTIME BREAKDOWN")
@@ -174,6 +227,16 @@ def print_summary(df):
         lat["change_pct"] = (lat["w4a8"] / lat["fp16"] - 1) * 100
     print(lat.to_string())
 
+    if "mem_mb" in df.columns:
+        print("\n" + "=" * 70)
+        print("MEMORY ALLOCATION (MB)")
+        print("=" * 70)
+        mem_pivot = df[df["layer_type"].isin(["attention", "ffn", "total"])].pivot_table(
+            index=["batch", "seq_len", "layer_type"],
+            columns="dtype", values="mem_mb",
+        )
+        print(mem_pivot.to_string())
+
     print("\n" + "=" * 70)
     print("BOTTLENECK SHIFT (attention % change)")
     print("=" * 70)
@@ -194,6 +257,7 @@ def main():
     df = load_results(args.input)
     plot_bottleneck_shift(df, args.output_dir)
     plot_latency(df, args.output_dir)
+    plot_memory(df, args.output_dir)
     print_summary(df)
 
 

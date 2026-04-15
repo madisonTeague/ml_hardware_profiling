@@ -1,134 +1,60 @@
-# Attention Profiling Experiments
+# ***Hardware-Aware Model Compression Profiling* - Spring 2026 15-442/642 Course Project**
 
-Hardware-aware comparison of **FP16** vs **INT8 KV** attention,
-measuring HBM traffic reduction and roofline shift on A100 GPUs.
+## Team
 
-## File layout
+- **Madison Teague ([mteague@andrew.cmu.edu](mailto:mteague@andrew.cmu.edu))**
+- **Jacob Scriffiny ([jscriffi@andrew.cmu.edu](mailto:jscriffi@andrew.cmu.edu))**
+- **Gautam Diwan ([gdiwan@andrew.cmu.edu](mailto:gdiwan@andrew.cmu.edu))**
 
-```
-attention_experiments/
-├── kernels.py      # Triton kernels (FP16 + INT8 KV flash-attention)
-├── quantize.py     # Per-head INT8 quantization + theoretical metrics
-├── benchmark.py    # Timing harness, roofline analysis, CSV export
-└── modal_app.py    # Modal runner (benchmark + NCU profiling)
-```
-
-## Setup
-
-```bash
-pip install modal torch triton pandas
-modal setup          # authenticate once
-```
-
-## Running experiments
-
-### 1 — Correctness check (fast, sanity-test kernels)
-```bash
-modal run modal_app.py --mode correctness
-```
-Expected: FP16 max_err < 1e-3, INT8KV max_err < 5e-2 (quantization noise)
-
-### 2 — Full benchmark sweep (seq × batch × dtype)
-```bash
-modal run modal_app.py                       # uses defaults: seq=[512,2048,4096], batch=[1,4,16]
-modal run modal_app.py --out results_exp1.csv
-```
-Downloads `results.csv` locally with latency, bandwidth, AI, and roofline columns.
-
-### 3 — NCU kernel profiling (one config at a time)
-```bash
-# FP16 baseline at seq=2048
-modal run modal_app.py --mode ncu --seq-len 2048 --dtype fp16
-
-# INT8 KV at seq=2048
-modal run modal_app.py --mode ncu --seq-len 2048 --dtype int8kv
-
-# Also try seq=512 and seq=4096 for the three sequence-length points
-```
-NCU report is saved locally as `ncu_<dtype>_N<seq_len>.txt`.
-
-### 4 — Retrieve saved results from Modal Volume
-```bash
-modal volume ls attn-results
-modal volume get attn-results results.csv ./results_from_modal.csv
-```
-
+# Execution Plan
 ---
 
-## What to measure / report
+## Experiment 0 — Environment & Baseline Validation
+- Confirm Modal A100 availability and CUDA version (nvidia-smi in interactive shell)
+- verify FP16 kernel max error < 1e-3 vs PyTorch SDPA
+- verify INT8 round-trip SNR > 30 dB
+- Record baseline GPU specs (HBM BW, peak TFLOP/s) to anchor roofline plots
+ 
+## Experiment 1 — KV Cache Quantization (Attention)
+- Run full benchmark sweep 
+    - Grid: seq_len ∈ {512, 2048, 4096} × batch ∈ {1, 4, 16} × dtype ∈ {fp16, int8kv}
+    - Collect: latency (ms), achieved BW (GB/s), arithmetic intensity, roofline bottleneck classification
+- Run NCU profiling for each of the 6 seq_len × dtype combos (batch=1 is sufficient for NCU) 
+    - Collect from NCU: dram bytes read, dram bytes written, gpu bytes throughput, SM utilization, occupancy
+- Key question to answer: does INT8 KV shift the kernel rightward on the roofline, and does latency scale proportionally to the ~33% theoretical memory reduction?
+ 
+## Experiment 2 — Weight Quantization (FFN / Linear Layers)
+- Quantize Qwen3-8B to W4A8 using AWQ 
+    - Save quantized model checkpoint to Modal Volume so you don't re-quantize every run
+- Run layer-wise profiling with torch.profiler on both FP16 and W4A8 models 
+    - Grid: batch ∈ {1, 4, 16}, seq_len ∈ {512, 2048, 4096}
+    - Collect per-layer: runtime (ms), % of total runtime, memory allocated
+    - Separate attention layers from FFN/MLP layers in the profiler output
+- Run NCU on isolated FFN forward pass (single nn.Linear call) for FP16 vs W4A8 
+    - Collect: DRAM bytes, SM utilization, arithmetic intensity
+- Key question to answer: does reducing FFN compute cost cause attention to become a larger share of total runtime (i.e., does the bottleneck shift)?
+ 
+## Experiment 3 — Structural Pruning
+- Apply PruneNet to Qwen3-8B at pruning ratios ∈ {10%, 20%, 30%} to get a spread of GEMM shape changes 
+- For each pruned model, run inference profiling (batch ∈ {1, 4, 16}, seq_len ∈ {512, 2048, 4096}) 
+    - Collect: throughput (tokens/sec), memory footprint (peak VRAM), GEMM shapes (log the weight matrix dims that change)
+- Run NCU on the pruned FFN GEMM kernels 
+    - Collect: SM utilization, achieved TFLOP/s — key check is whether smaller GEMMs lose efficiency (tile underutilization)
+- Key question to answer: does pruning-induced GEMM shape change hurt hardware utilization even when parameter count drops?
+ 
+# Experiment 4 — Combined Configuration
+- Compose all three: W4A8 weight quant + INT8 KV attention + structural pruning (pick one pruning ratio, e.g. 20%)
+- Run end-to-end inference on WikiText-103 (as specified in the proposal) 
+    - Sequence lengths: 512, 2048, 4096 — batch size 1 (realistic serving scenario)
+    - Collect: perplexity, total latency, per-layer runtime breakdown
+- Run NCU on the combined model for the same 6 seq_len × dtype points as Experiment 1 
+    - Collect same metrics as Exp 1 so you can directly compare roofline plots
+- Key question to answer: are the gains additive, redundant, or do they conflict (e.g., does INT8 KV BW savings get masked when FFN is already the bottleneck from pruning)?
+ 
+## Analysis & Writeup
+- Roofline plots: one per experiment, overlay FP16 vs compressed variant — x-axis = arithmetic intensity, y-axis = TFLOP/s, mark A100 ridge point
+- Layer-wise runtime breakdown bar charts: attention vs FFN share across compression configs
+- KV memory traffic table: theoretical vs NCU-measured bytes for Exp 1 (validates your kernel)
+- Perplexity vs hardware efficiency tradeoff table for the combined config
+- One paragraph per experiment in the paper answering the specific research question listed above
 
-### Primary metrics (from `results.csv`)
-
-| Column | Description |
-|---|---|
-| `latency_ms` | Median kernel latency (CUDA events) |
-| `bw_GBps` | Achieved memory bandwidth (theoretical bytes / time) |
-| `ai_theory` | Arithmetic intensity (FLOP/byte) |
-| `bottleneck` | `memory` or `compute` (roofline classification) |
-| `hw_util_pct` | % of roofline ceiling achieved |
-| `max_diff_vs_ref` | Max abs error vs PyTorch SDPA |
-
-### Secondary metrics (from NCU report)
-
-Key NCU metrics to highlight in the paper:
-
-```
-dram__bytes_read.sum           → actual HBM reads (validates our theory)
-dram__bytes_write.sum          → actual HBM writes
-gpu__dram_throughput...        → % of peak HBM BW utilized
-sm__throughput...              → % of peak SM throughput
-sm__warps_active...            → occupancy
-```
-
-### Expected findings
-
-- At **long seq_len** (4096): attention is memory-bound (AI < ridge point ~2 FLOP/byte on A100)
-- INT8 KV reduces KV read bytes by **~50%** → total bytes ~**33% lower**
-- This shifts AI rightward on the roofline plot
-- At short seq_len (512): both variants may be closer to compute-bound
-
----
-
-## Theoretical memory traffic
-
-```
-FP16 baseline:
-  Reads:  Q[fp16] + K[fp16] + V[fp16]  =  3 * B*H*N*D * 2 bytes
-  Writes: O[fp16]                       =      B*H*N*D * 2 bytes
-  Total:  8 * B*H*N*D bytes
-
-INT8 KV:
-  Reads:  Q[fp16] + K[int8] + V[int8] + scales[fp16]
-        = B*H*N*D*2 + B*H*N*D*1 + B*H*N*D*1 + B*H*4 bytes
-  Writes: O[fp16]  =  B*H*N*D * 2 bytes
-  Total:  ~6 * B*H*N*D bytes  (+tiny scale overhead)
-  Reduction: ~25% vs FP16 total  (33% KV-only reduction)
-```
-
----
-
-## Roofline parameters (A100 SXM)
-
-| Parameter | Value |
-|---|---|
-| Peak HBM bandwidth | 2,000 GB/s |
-| Peak FP16 tensor core | 312 TFLOP/s |
-| Ridge point | ~156 FLOP/byte |
-
-At seq_len=2048 the arithmetic intensity is **well below** the ridge point,
-so both variants are memory-bound — the BW reduction from INT8 KV should
-translate almost linearly to latency reduction.
-
----
-
-## Tuning block sizes
-
-If latency is not as expected, try:
-```python
-# In benchmark.py BenchConfig
-BLOCK_M = 128   # larger M blocks → better compute efficiency
-BLOCK_N = 64    # larger N → fewer loop iterations
-```
-
-Triton autotune can also be added to `_attn_fp16_kernel` by replacing
-the fixed `BLOCK_M/BLOCK_N` with `@triton.autotune(configs=[...], key=['N_CTX', 'HEAD_DIM'])`.

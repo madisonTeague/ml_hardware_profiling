@@ -35,7 +35,7 @@ from quantize import (
 @dataclass
 class BenchConfig:
     batch_size:  int   = 1
-    num_heads:   int   = 16       # Qwen3-7B: 32 heads; use 16 for A100 profiling
+    num_heads:   int   = 16       # Qwen3-8B: 32 heads; use 16 for A100 profiling
     head_dim:    int   = 128
     seq_len:     int   = 512
     causal:      bool  = True

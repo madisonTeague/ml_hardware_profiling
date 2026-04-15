@@ -52,13 +52,16 @@ def load_model(model_path, dtype="fp16"):
 # ---------------------------------------------------------------------------
 
 class _TimingHook:
-    """Attaches pre/post hooks to record elapsed CUDA time."""
+    """Attaches pre/post hooks to record elapsed CUDA time and memory delta."""
     def __init__(self):
         self.times: list[float] = []
+        self.mem_deltas: list[int] = []
         self._start = None
+        self._mem_before = 0
 
     def pre(self, module, inp):
         self._start = torch.cuda.Event(enable_timing=True)
+        self._mem_before = torch.cuda.memory_allocated()
         self._start.record()
 
     def post(self, module, inp, out):
@@ -66,6 +69,7 @@ class _TimingHook:
         end.record()
         torch.cuda.synchronize()
         self.times.append(self._start.elapsed_time(end))
+        self.mem_deltas.append(torch.cuda.memory_allocated() - self._mem_before)
 
 
 def profile_model(model, tokenizer, cfg: ProfileConfig):
@@ -101,19 +105,22 @@ def profile_model(model, tokenizer, cfg: ProfileConfig):
             hooks_handles.append(mod.register_forward_pre_hook(th.pre))
             hooks_handles.append(mod.register_forward_hook(th.post))
 
-    # Also time total end-to-end
+    # Also time total end-to-end + peak memory
     total_times = []
+    peak_mem_bytes = []
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
 
     print(f"  Profiling ({cfg.n_trials} iters)...", end="", flush=True)
     with torch.no_grad():
         for _ in range(cfg.n_trials):
+            torch.cuda.reset_peak_memory_stats()
             start_ev.record()
             _ = model(input_ids)
             end_ev.record()
             torch.cuda.synchronize()
             total_times.append(start_ev.elapsed_time(end_ev))
+            peak_mem_bytes.append(torch.cuda.max_memory_allocated())
     print(" done")
 
     # Remove hooks
@@ -125,11 +132,11 @@ def profile_model(model, tokenizer, cfg: ProfileConfig):
     n_layers_attn = len(attn_hooks)
     n_layers_ffn = len(ffn_hooks)
 
-    def per_trial_sum(hooks_list):
+    def per_trial_sum(hooks_list, attr="times"):
         """Sum across layers for each trial, return list of per-trial totals."""
         per_trial = [0.0] * cfg.n_trials
         for th in hooks_list:
-            for i, t in enumerate(th.times):
+            for i, t in enumerate(getattr(th, attr)):
                 per_trial[i] += t
         return per_trial
 
@@ -146,20 +153,33 @@ def profile_model(model, tokenizer, cfg: ProfileConfig):
     ffn_pct = (ffn_ms / total_ms * 100) if total_ms > 0 else 0
     other_pct = (other_ms / total_ms * 100) if total_ms > 0 else 0
 
+    # Memory: per-layer allocation deltas (median across trials)
+    attn_mem = np.median(per_trial_sum(attn_hooks, "mem_deltas"))
+    ffn_mem = np.median(per_trial_sum(ffn_hooks, "mem_deltas"))
+    peak_mem = np.median(peak_mem_bytes)
+    total_mem_mb = round(peak_mem / 1e6, 2)
+    attn_mem_mb = round(attn_mem / 1e6, 2)
+    ffn_mem_mb = round(ffn_mem / 1e6, 2)
+    other_mem_mb = round(max(0, peak_mem - attn_mem - ffn_mem) / 1e6, 2)
+
     print(f"  Total: {total_ms:.2f} ms | "
           f"Attn: {attn_ms:.2f} ms ({attn_pct:.1f}%) | "
           f"FFN: {ffn_ms:.2f} ms ({ffn_pct:.1f}%) | "
           f"Other: {other_ms:.2f} ms ({other_pct:.1f}%)")
+    print(f"  Peak mem: {total_mem_mb:.1f} MB | "
+          f"Attn alloc: {attn_mem_mb:.1f} MB | "
+          f"FFN alloc: {ffn_mem_mb:.1f} MB")
 
+    base = dict(dtype=cfg.dtype, batch=cfg.batch_size, seq_len=cfg.seq_len)
     rows = [
-        dict(dtype=cfg.dtype, batch=cfg.batch_size, seq_len=cfg.seq_len,
-             layer_type="attention", time_ms=attn_ms, time_pct=round(attn_pct, 2)),
-        dict(dtype=cfg.dtype, batch=cfg.batch_size, seq_len=cfg.seq_len,
-             layer_type="ffn", time_ms=ffn_ms, time_pct=round(ffn_pct, 2)),
-        dict(dtype=cfg.dtype, batch=cfg.batch_size, seq_len=cfg.seq_len,
-             layer_type="other", time_ms=other_ms, time_pct=round(other_pct, 2)),
-        dict(dtype=cfg.dtype, batch=cfg.batch_size, seq_len=cfg.seq_len,
-             layer_type="total", time_ms=total_ms, time_pct=100.0),
+        dict(**base, layer_type="attention", time_ms=attn_ms,
+             time_pct=round(attn_pct, 2), mem_mb=attn_mem_mb),
+        dict(**base, layer_type="ffn", time_ms=ffn_ms,
+             time_pct=round(ffn_pct, 2), mem_mb=ffn_mem_mb),
+        dict(**base, layer_type="other", time_ms=other_ms,
+             time_pct=round(other_pct, 2), mem_mb=other_mem_mb),
+        dict(**base, layer_type="total", time_ms=total_ms,
+             time_pct=100.0, mem_mb=total_mem_mb),
     ]
     return rows
 

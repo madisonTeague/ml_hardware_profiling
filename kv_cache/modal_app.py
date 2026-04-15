@@ -48,8 +48,7 @@ attention_image = (
         "apt-get update -qq && apt-get install -y --no-install-recommends "
         "nsight-compute 2>/dev/null || true",
     )
-    # Copy our local experiment code into the image
-    .add_local_dir(".", remote_path="/app", ignore=[".git", "__pycache__", "*.pyc", "*.pyo", "*.md", "*.csv", "*.txt", "*.ncu-rep"])
+    .add_local_dir(str(Path(__file__).parent), remote_path="/app", ignore=[".git", "__pycache__", "*.pyc", "*.pyo", "*.md", "*.csv", "*.txt", "*.ncu-rep"])
 )
 
 

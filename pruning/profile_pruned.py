@@ -58,7 +58,6 @@ def load_model(model_path: str, torch_dtype=torch.float16):
     model = AutoModelForCausalLM.from_pretrained(
         model_path, trust_remote_code=True,
         torch_dtype=torch_dtype, device_map="auto",
-        rope_scaling={"type": "dynamic", "factor": 3.0}
     )
     model.eval()
     return model, tokenizer

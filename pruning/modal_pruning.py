@@ -100,6 +100,7 @@ results_vol = modal.Volume.from_name("pruning-results", create_if_missing=True)
 def prune_all_ratios(
     model_name: str = "Qwen/Qwen3-8B",
     ratios: list[float] = [0.1, 0.2, 0.3],
+    n_calib_samples: int = 64,
     wandb_project: str | None = None,
     regenerate: bool = False,
 ) -> dict:
@@ -127,6 +128,7 @@ def prune_all_ratios(
         model, tokenizer, gemm_rows = prune_model(
             model_name, ratio, out_dir,
             torch_dtype=torch.float16,
+            n_calib_samples=n_calib_samples,
             wandb_project=wb_project,
         )
 
@@ -313,7 +315,6 @@ def _torch_profiler_fallback(model_path, seq_len, batch_size):
     model = AutoModelForCausalLM.from_pretrained(
         model_path, trust_remote_code=True,
         torch_dtype=torch.float16, device_map="auto",
-        rope_scaling={"type": "dynamic", "factor": 3.0}
     )
     model.eval()
     input_ids = torch.randint(0, tokenizer.vocab_size,
@@ -344,6 +345,7 @@ def main(
     ratio: float = 0.0,
     seq_len: int = 2048,
     batch_size: int = 1,
+    calib_samples: int = 64,
     wandb_project: str = "",
     regenerate: bool = False,
 ):
@@ -355,17 +357,20 @@ def main(
         all      -- prune + profile
 
     Flags:
-        --regenerate  Force re-pruning even if models already exist.
-                      New models are saved with a timestamp suffix;
-                      profiling always picks the latest version.
+        --calib-samples  WikiText-103 chunks for activation calibration
+                         (default 64; set 0 for weight-only scoring).
+        --regenerate     Force re-pruning even if models already exist.
+                         New models are saved with a timestamp suffix;
+                         profiling always picks the latest version.
     """
     ratios = [0.1, 0.2, 0.3]
     wb = wandb_project or None
 
     if command == "prune":
         result = prune_all_ratios.remote(
-            model_name=model, ratios=ratios, wandb_project=wb,
-            regenerate=regenerate)
+            model_name=model, ratios=ratios,
+            n_calib_samples=calib_samples,
+            wandb_project=wb, regenerate=regenerate)
         for tag, info in result.items():
             print(f"  {tag}: {info['status']}  ({info['path']})")
 
@@ -379,11 +384,6 @@ def main(
     elif command == "ncu":
         if ratio > 0:
             label = f"pruned_{int(ratio * 100)}pct"
-            # NCU runs remotely where /models is mounted, so we pass the
-            # tag prefix and let the remote function resolve it. However
-            # _find_latest_model needs local filesystem access -- since
-            # the volume is only mounted inside the container, we pass
-            # the tag and let profile_ncu resolve it.
             model_path = f"/models/{_tag_for_ratio(ratio)}"
         else:
             model_path = model
@@ -401,8 +401,9 @@ def main(
     elif command == "all":
         print("Step 1/2: Pruning ...")
         result = prune_all_ratios.remote(
-            model_name=model, ratios=ratios, wandb_project=wb,
-            regenerate=regenerate)
+            model_name=model, ratios=ratios,
+            n_calib_samples=calib_samples,
+            wandb_project=wb, regenerate=regenerate)
         for tag, info in result.items():
             print(f"  {tag}: {info['status']}  ({info['path']})")
 

@@ -30,7 +30,6 @@ tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
     model_path, trust_remote_code=True,
     torch_dtype=torch.float16, device_map="auto",
-    rope_scaling={"type": "dynamic", "factor": 3.0}
 )
 model.eval()
 

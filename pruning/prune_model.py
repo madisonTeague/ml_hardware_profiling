@@ -1,34 +1,39 @@
 """
 Structured pruning of FFN layers for Experiment 3.
 
-Activation-aware neuron importance scoring (Wanda-style) followed by
-physical removal of the least-important intermediate neurons from
-gate_proj, up_proj, and down_proj.  Produces a valid HuggingFace
-checkpoint with a smaller intermediate_size that can be loaded with
-AutoModelForCausalLM.
+Three importance-scoring methods are available (--method):
 
-Importance criterion (per neuron i in each FFN layer):
-
+  wanda  (default)
+    Activation-aware, Wanda-style (Sun et al. 2023).
     gate_score[i] = sqrt( gate_proj.weight[i,:]^2  @  x_rms^2 )
     up_score[i]   = sqrt( up_proj.weight[i,:]^2    @  x_rms^2 )
     down_norm[i]  = || down_proj.weight[:, i] ||_2
     score[i]      = gate_score[i] * up_score[i] * down_norm[i]
+    Requires a 64-sample calibration pass; set --calib-samples 0 to
+    fall back to weight-only L2 norms.
 
-x_rms is the per-feature RMS of the post-LayerNorm hidden states
-collected from a small calibration pass (default 64 × 512 tokens from
-WikiText-103 train).  This captures both weight magnitude and actual
-input activation magnitude (Wanda, Sun et al. 2023), which is critical
-for SwiGLU where a neuron's contribution is the product
-silu(gate_i) * up_i * down_col_i.
+  spectral
+    PruneNet-style spectral preservation (Sengupta et al. ICLR 2025).
+    Calibration-free.  Uses truncated SVD of up_proj (FFN1) to measure
+    each neuron's contribution to the singular-value distribution:
+    svd_score[i]  = || (U * S)[i, :] ||_2   (spectral leverage)
+    score[i]      = svd_score[i] * down_norm[i]
+    Keeps neurons whose removal least shifts the singular-value CDF
+    (approximation of PruneNet's KS-distance minimisation).
 
-Set --calib-samples 0 to fall back to weight-only scoring.
+  spectral+wanda
+    Per-layer L2-normalised product of both scores:
+    score[i] = norm(wanda)[i] * norm(spectral)[i] * down_norm[i]
+    Combines activation relevance with spectral structure preservation.
 
 No fine-tuning of any kind.
 
 Usage:
     python prune_model.py --model Qwen/Qwen3-8B --ratio 0.2 --output ./pruned_20pct
-    python prune_model.py --model Qwen/Qwen3-8B --ratio 0.1 0.2 0.3
-    python prune_model.py --model Qwen/Qwen3-8B --ratio 0.2 --calib-samples 0  # weight-only
+    python prune_model.py --model Qwen/Qwen3-8B --ratio 0.05 0.1 0.2 0.3
+    python prune_model.py --model Qwen/Qwen3-8B --ratio 0.1 --method spectral
+    python prune_model.py --model Qwen/Qwen3-8B --ratio 0.1 --method spectral+wanda
+    python prune_model.py --model Qwen/Qwen3-8B --ratio 0.2 --calib-samples 0
 """
 
 import argparse
@@ -205,58 +210,109 @@ def collect_mlp_input_stats(
 # Importance scoring
 # ------------------------------------------------------------------
 
+def _spectral_scores_for_layer(mlp, n_sv: int = 256) -> torch.Tensor:
+    """Compute PruneNet-style spectral leverage scores for one FFN layer.
+
+    Uses truncated SVD of up_proj (FFN1) — the matrix PruneNet targets.
+    For neuron i:
+
+        svd_score[i] = || (U * S)[i, :] ||_2
+                     = sqrt( sum_k  S[k]^2 * U[i,k]^2 )
+
+    This measures how much row i drives the dominant singular directions,
+    approximating PruneNet's KS-distance minimisation criterion without
+    any training.  torch.svd_lowrank (randomised) keeps runtime fast
+    even for large [intermediate, hidden] matrices.
+
+    Returns a float32 CPU tensor of shape [intermediate_size].
+    """
+    W = mlp.up_proj.weight.float()          # [intermediate, hidden]
+    q = min(n_sv, min(W.shape))
+    U, S, _Vh = torch.svd_lowrank(W, q=q, niter=4)
+    # U: [intermediate, q], S: [q]
+    US = U * S.unsqueeze(0)                 # [intermediate, q]
+    return US.pow(2).sum(dim=1).sqrt().cpu()  # [intermediate]
+
+
 def compute_neuron_importance(
     model,
     x_rms: dict[int, torch.Tensor] | None = None,
+    method: str = "wanda",
     use_triton: bool = True,
+    n_sv: int = 256,
 ) -> dict[int, torch.Tensor]:
     """Return per-neuron importance scores for every FFN layer.
 
-    With activation calibration (*x_rms* provided, recommended):
-
+    method="wanda"  (activation-aware, recommended with calibration data)
         gate_score[i] = sqrt( gate_proj.weight[i,:]^2  @  x_rms^2 )
         up_score[i]   = sqrt( up_proj.weight[i,:]^2    @  x_rms^2 )
         down_norm[i]  = || down_proj.weight[:, i] ||_2
         score[i]      = gate_score[i] * up_score[i] * down_norm[i]
+        Falls back to weight-only L2 norms if x_rms is None.
 
-    gate_score / up_score are the expected output magnitudes of each
-    SwiGLU neuron over the calibration distribution (Wanda-style).
-    Their product captures the bottleneck in silu(gate_i) * up_i, and
-    multiplying by down_norm weights by how much the neuron writes back
-    into the residual stream.
+    method="spectral"  (PruneNet-style, calibration-free)
+        svd_score[i] = || (U * S)[i, :] ||_2  from up_proj truncated SVD
+        score[i]     = svd_score[i] * down_norm[i]
 
-    Without calibration (*x_rms* is None): falls back to weight-only
-    L2 norms with the same product formula, using Triton when available.
+    method="spectral+wanda"
+        Per-layer L2-normalised product of both scores:
+        score[i] = norm(wanda)[i] * norm(spectral)[i] * down_norm[i]
 
     Returns a dict  {layer_index: Tensor[intermediate_size]}  on CPU.
     """
+    if method not in ("wanda", "spectral", "spectral+wanda"):
+        raise ValueError(f"Unknown method {method!r}. "
+                         "Choose 'wanda', 'spectral', or 'spectral+wanda'.")
+
     do_triton = use_triton and HAS_TRITON and torch.cuda.is_available()
     importance: dict[int, torch.Tensor] = {}
 
     for idx, layer in enumerate(_iter_decoder_layers(model)):
         mlp = layer.mlp
 
-        # down_proj column norms are always weight-only (same for both paths)
+        # down_proj column norms are shared across all methods
         if do_triton:
-            down_norm = _triton_col_l2(mlp.down_proj.weight)
+            down_norm = _triton_col_l2(mlp.down_proj.weight).cpu()
         else:
-            down_norm = mlp.down_proj.weight.float().norm(dim=0)
+            down_norm = mlp.down_proj.weight.float().norm(dim=0).cpu()
 
-        if x_rms is not None and idx in x_rms:
-            # Activation-aware path: expected output magnitude per neuron
-            rms_sq = x_rms[idx].float().pow(2)           # [hidden_size]
-            gate_score = mlp.gate_proj.weight.float().pow(2).mv(rms_sq).sqrt()
-            up_score   = mlp.up_proj.weight.float().pow(2).mv(rms_sq).sqrt()
-            importance[idx] = (gate_score * up_score * down_norm).cpu()
-        else:
-            # Weight-only fallback
-            if do_triton:
-                gate_norm = _triton_row_l2(mlp.gate_proj.weight)
-                up_norm   = _triton_row_l2(mlp.up_proj.weight)
+        # ---- Wanda scores (activation-aware or weight-only fallback) ----
+        wanda_score: torch.Tensor | None = None
+        if method in ("wanda", "spectral+wanda"):
+            if x_rms is not None and idx in x_rms:
+                rms_sq     = x_rms[idx].float().pow(2)
+                gate_score = mlp.gate_proj.weight.float().pow(2).mv(rms_sq).sqrt().cpu()
+                up_score   = mlp.up_proj.weight.float().pow(2).mv(rms_sq).sqrt().cpu()
             else:
-                gate_norm = mlp.gate_proj.weight.float().norm(dim=1)
-                up_norm   = mlp.up_proj.weight.float().norm(dim=1)
-            importance[idx] = (gate_norm * up_norm * down_norm).cpu()
+                if do_triton:
+                    gate_score = _triton_row_l2(mlp.gate_proj.weight).cpu()
+                    up_score   = _triton_row_l2(mlp.up_proj.weight).cpu()
+                else:
+                    gate_score = mlp.gate_proj.weight.float().norm(dim=1).cpu()
+                    up_score   = mlp.up_proj.weight.float().norm(dim=1).cpu()
+            wanda_score = gate_score * up_score  # [intermediate]
+
+        # ---- Spectral scores (SVD leverage, calibration-free) ----
+        spectral_score: torch.Tensor | None = None
+        if method in ("spectral", "spectral+wanda"):
+            spectral_score = _spectral_scores_for_layer(mlp, n_sv=n_sv)
+
+        # ---- Combine ----
+        if method == "wanda":
+            assert wanda_score is not None
+            importance[idx] = wanda_score * down_norm
+
+        elif method == "spectral":
+            assert spectral_score is not None
+            importance[idx] = spectral_score * down_norm
+
+        else:  # spectral+wanda
+            assert wanda_score is not None and spectral_score is not None
+            # Normalise each to unit L2 per layer before multiplying so
+            # neither score dominates purely due to scale differences.
+            w_norm = wanda_score / (wanda_score.norm() + 1e-8)
+            s_norm = spectral_score / (spectral_score.norm() + 1e-8)
+            importance[idx] = w_norm * s_norm * down_norm
 
     return importance
 
@@ -459,39 +515,42 @@ def _wandb_log_prune_summary(model, prune_ratio: float, orig_inter: int):
 
 def prune_model(model_name: str, prune_ratio: float, output_dir: str,
                 torch_dtype=torch.float16,
+                method: str = "wanda",
                 n_calib_samples: int = 64,
+                n_sv: int = 256,
                 wandb_project: str | None = None) -> tuple:
     """Load, prune, save.  Returns (model, tokenizer, gemm_rows).
 
     Parameters
     ----------
+    method:
+        Importance scoring strategy: "wanda" | "spectral" | "spectral+wanda".
     n_calib_samples:
-        Number of 512-token WikiText-103 chunks to use for activation
-        calibration.  Set to 0 to fall back to weight-only scoring.
+        WikiText-103 chunks for activation calibration (wanda / spectral+wanda).
+        Set to 0 to use weight-only norms.  Ignored for method="spectral".
+    n_sv:
+        Number of singular values to use in truncated SVD (spectral paths).
     wandb_project:
         If set (or WANDB_PROJECT env var), initialises a W&B run.
     """
     import os
     wb_project = wandb_project or os.environ.get("WANDB_PROJECT")
-    method_name = (
-        f"wanda_activation_calib_{n_calib_samples}samples"
-        if n_calib_samples > 0 else "magnitude_l2_product"
-    )
     if HAS_WANDB and wb_project and wandb.run is None:
         wandb.init(
             project=wb_project,
-            name=f"prune-{int(prune_ratio*100)}pct",
+            name=f"prune-{int(prune_ratio*100)}pct-{method}",
             config={
                 "model": model_name,
                 "prune_ratio": prune_ratio,
-                "method": method_name,
+                "method": method,
                 "scope": "ffn_only",
-                "n_calib_samples": n_calib_samples,
+                "n_calib_samples": n_calib_samples if method != "spectral" else 0,
+                "n_sv": n_sv,
             },
         )
 
     print(f"\n{'='*60}")
-    print(f"PRUNING  model={model_name}  ratio={prune_ratio}")
+    print(f"PRUNING  model={model_name}  ratio={prune_ratio}  method={method}")
     print(f"{'='*60}")
 
     # 1) Load baseline model/tokenizer checkpoint.
@@ -507,12 +566,15 @@ def prune_model(model_name: str, prune_ratio: float, output_dir: str,
     print(f"  intermediate_size: {orig_inter} -> {n_keep}  "
           f"(removing {orig_inter - n_keep} neurons per layer)")
 
-    # 2) Optionally gather activation statistics for calibration-aware scoring.
+    # 2) Gather activation statistics when required by the chosen method.
     use_triton = HAS_TRITON and torch.cuda.is_available()
     x_rms = None
-    if n_calib_samples > 0:
-        print(f"  Importance: activation-aware / Wanda-style  "
-              f"({n_calib_samples} calib samples)")
+    needs_calib = method in ("wanda", "spectral+wanda") and n_calib_samples > 0
+
+    if method == "spectral":
+        print(f"  Importance: spectral / PruneNet-style  (n_sv={n_sv}, calibration-free)")
+    elif needs_calib:
+        print(f"  Importance: {method}  ({n_calib_samples} calib samples, n_sv={n_sv})")
         try:
             x_rms = collect_mlp_input_stats(
                 model, tokenizer,
@@ -523,12 +585,15 @@ def prune_model(model_name: str, prune_ratio: float, output_dir: str,
             print(f"  WARNING: calibration failed ({e}), falling back to weight-only.")
             x_rms = None
     else:
-        print(f"  Importance: weight-only  "
+        print(f"  Importance: {method} weight-only  "
               f"({'Triton' if use_triton else 'PyTorch'})")
 
     # 3) Score each FFN intermediate neuron.
     print("  Computing neuron importance scores ...")
-    importance = compute_neuron_importance(model, x_rms=x_rms, use_triton=use_triton)
+    importance = compute_neuron_importance(
+        model, x_rms=x_rms, method=method,
+        use_triton=use_triton, n_sv=n_sv,
+    )
     _wandb_log_importance(importance, prune_ratio)
 
     # 4) Physically shrink FFN projection matrices in every decoder block.
@@ -579,17 +644,23 @@ def _write_gemm_csv(rows: list[dict], path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Structured FFN pruning (activation-aware, no retraining)")
+        description="Structured FFN pruning — wanda / spectral / spectral+wanda")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-8B",
                         help="HuggingFace model name")
     parser.add_argument("--ratio", type=float, nargs="+",
-                        default=[0.1, 0.2, 0.3],
-                        help="Pruning ratio(s)")
+                        default=[0.05, 0.1, 0.2, 0.3],
+                        help="Pruning ratio(s) as fractions, e.g. 0.05 0.1 0.2 0.3")
     parser.add_argument("--output", type=str, default=None,
                         help="Output dir (auto-generated if omitted)")
+    parser.add_argument("--method", type=str, default="wanda",
+                        choices=["wanda", "spectral", "spectral+wanda"],
+                        help="Importance scoring method (default: wanda)")
     parser.add_argument("--calib-samples", type=int, default=64,
                         help="WikiText-103 chunks for activation calibration "
-                             "(0 = weight-only scoring)")
+                             "(0 = weight-only; ignored for --method spectral)")
+    parser.add_argument("--n-sv", type=int, default=256,
+                        help="Singular values to use in truncated SVD "
+                             "(spectral / spectral+wanda paths, default 256)")
     parser.add_argument("--wandb-project", type=str, default=None,
                         help="W&B project name (enables logging)")
     args = parser.parse_args()
@@ -598,7 +669,9 @@ def main():
     for ratio in args.ratio:
         out_dir = args.output or f"./pruned_{int(ratio * 100)}pct"
         _, _, gemm_rows = prune_model(args.model, ratio, out_dir,
+                                      method=args.method,
                                       n_calib_samples=args.calib_samples,
+                                      n_sv=args.n_sv,
                                       wandb_project=args.wandb_project)
         all_gemm_rows.extend(gemm_rows)
 

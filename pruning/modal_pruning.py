@@ -99,8 +99,10 @@ results_vol = modal.Volume.from_name("pruning-results", create_if_missing=True)
 )
 def prune_all_ratios(
     model_name: str = "Qwen/Qwen3-8B",
-    ratios: list[float] = [0.1, 0.2, 0.3],
+    ratios: list[float] = [0.05, 0.1, 0.2, 0.3],
+    method: str = "wanda",
     n_calib_samples: int = 64,
+    n_sv: int = 256,
     wandb_project: str | None = None,
     regenerate: bool = False,
 ) -> dict:
@@ -128,7 +130,9 @@ def prune_all_ratios(
         model, tokenizer, gemm_rows = prune_model(
             model_name, ratio, out_dir,
             torch_dtype=torch.float16,
+            method=method,
             n_calib_samples=n_calib_samples,
+            n_sv=n_sv,
             wandb_project=wb_project,
         )
 
@@ -338,45 +342,80 @@ def _torch_profiler_fallback(model_path, seq_len, batch_size):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+_DEFAULT_RATIOS = [0.05, 0.1, 0.2, 0.3]
+
+
+def _parse_ratios(ratios_str: str) -> list[float]:
+    """Parse a comma-separated ratio string into a list of floats.
+
+    Accepts fractions (0.05,0.1,0.2) or integer percentages (5,10,20,30).
+    Integer values > 1 are automatically divided by 100.
+    """
+    parts = [r.strip() for r in ratios_str.split(",") if r.strip()]
+    result = []
+    for p in parts:
+        v = float(p)
+        if v > 1.0:          # treat as percentage, e.g. "5" -> 0.05
+            v = v / 100.0
+        result.append(v)
+    return result
+
+
 @app.local_entrypoint()
 def main(
     command: str = "prune",
     model: str = "Qwen/Qwen3-8B",
     ratio: float = 0.0,
+    ratios: str = "",
     seq_len: int = 2048,
     batch_size: int = 1,
+    method: str = "wanda",
     calib_samples: int = 64,
+    n_sv: int = 256,
     wandb_project: str = "",
     regenerate: bool = False,
 ):
     """
     Commands:
-        prune    -- Prune model at 10%, 20%, 30%
+        prune    -- Prune model at default ratios (5/10/20/30%)
         profile  -- Full profiling sweep (baseline + all pruned)
         ncu      -- NCU profiling (specify --ratio, --seq-len, --batch-size)
         all      -- prune + profile
 
     Flags:
+        --ratios         Comma-separated list of ratios to prune/profile.
+                         Accepts fractions (0.05,0.1,0.2,0.3) or integer
+                         percentages (5,10,20,30).  Defaults to 5/10/20/30%.
+        --method         Importance scoring: wanda | spectral | spectral+wanda
+                         (default: wanda).
         --calib-samples  WikiText-103 chunks for activation calibration
-                         (default 64; set 0 for weight-only scoring).
+                         (default 64; set 0 for weight-only; ignored for spectral).
+        --n-sv           Singular values for truncated SVD in spectral paths
+                         (default 256).
         --regenerate     Force re-pruning even if models already exist.
                          New models are saved with a timestamp suffix;
                          profiling always picks the latest version.
+
+    Examples:
+        modal run modal_pruning.py --command all --regenerate
+        modal run modal_pruning.py --command all --ratios "5,10,20,30" --method spectral
+        modal run modal_pruning.py --command prune --ratios "0.05,0.15,0.25" --method spectral+wanda
+        modal run modal_pruning.py --command ncu --ratio 0.1
     """
-    ratios = [0.1, 0.2, 0.3]
+    parsed_ratios = _parse_ratios(ratios) if ratios else _DEFAULT_RATIOS
     wb = wandb_project or None
 
     if command == "prune":
         result = prune_all_ratios.remote(
-            model_name=model, ratios=ratios,
-            n_calib_samples=calib_samples,
+            model_name=model, ratios=parsed_ratios,
+            method=method, n_calib_samples=calib_samples, n_sv=n_sv,
             wandb_project=wb, regenerate=regenerate)
         for tag, info in result.items():
             print(f"  {tag}: {info['status']}  ({info['path']})")
 
     elif command == "profile":
         csv_bytes = profile_pruned_sweep.remote(
-            model_name=model, ratios=ratios, wandb_project=wb)
+            model_name=model, ratios=parsed_ratios, wandb_project=wb)
         out = Path("results_exp3.csv")
         out.write_bytes(csv_bytes)
         print(f"Downloaded {out}")
@@ -399,20 +438,22 @@ def main(
         print(report[:3000])
 
     elif command == "all":
-        print("Step 1/2: Pruning ...")
+        print(f"Step 1/2: Pruning  ratios={[int(r*100) for r in parsed_ratios]}%  "
+              f"method={method} ...")
         result = prune_all_ratios.remote(
-            model_name=model, ratios=ratios,
-            n_calib_samples=calib_samples,
+            model_name=model, ratios=parsed_ratios,
+            method=method, n_calib_samples=calib_samples, n_sv=n_sv,
             wandb_project=wb, regenerate=regenerate)
         for tag, info in result.items():
             print(f"  {tag}: {info['status']}  ({info['path']})")
 
         print("\nStep 2/2: Profiling ...")
         csv_bytes = profile_pruned_sweep.remote(
-            model_name=model, ratios=ratios, wandb_project=wb)
+            model_name=model, ratios=parsed_ratios, wandb_project=wb)
         out = Path("results_exp3.csv")
         out.write_bytes(csv_bytes)
         print(f"Downloaded {out}")
 
     else:
-        raise ValueError(f"Unknown command: {command}")
+        raise ValueError(f"Unknown command: {command!r}. "
+                         "Choose prune | profile | ncu | all.")

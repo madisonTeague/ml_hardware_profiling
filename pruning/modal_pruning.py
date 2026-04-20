@@ -372,7 +372,7 @@ def main(
     method: str = "wanda",
     calib_samples: int = 64,
     n_sv: int = 256,
-    wandb_project: str = "",
+    wandb_project: str = "CMU-16542-MLSys-Compression",
     regenerate: bool = False,
 ):
     """

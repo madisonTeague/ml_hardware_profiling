@@ -442,7 +442,7 @@ def _wandb_log_importance(importance: dict[int, torch.Tensor], prune_ratio: floa
 
     all_scores = torch.cat(list(importance.values()))
     wandb.log({
-        f"importance/global_histogram": wandb.Histogram(all_scores.numpy()),
+        f"importance/global_histogram": wandb.Histogram(all_scores.detach().numpy()),
         f"importance/global_mean": all_scores.mean().item(),
         f"importance/global_std": all_scores.std().item(),
     })

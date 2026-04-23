@@ -23,8 +23,10 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 HERE      = Path(__file__).parent
-KV_CSV    = HERE / "results_from_modal.csv"
+KV_CSV    = HERE / "results" / "results_from_modal.csv"
 EXP2_CSV  = HERE.parent / "weight_quant" / "results_exp2_layers.csv"
+COMBINED_MEM_CSV  = HERE.parent / "combined" / "results" / "combined_memory.csv"
+COMBINED_PPL_JSON = HERE.parent / "combined" / "results" / "combined_perplexity.json"
 OUT_DIR   = HERE / "figures"
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -285,28 +287,20 @@ def fig_memory_comparison():
     """
     Side-by-side bar chart showing GB saved by each technique at B=1 and B=16.
     Makes the 'orthogonal resources' argument visually concrete.
+    Uses measured values from combined_memory.csv.
     """
-    # W4A8 VRAM savings from findings.md
-    w4a8_savings = {
-        (1,  512):  16.6 - 6.3,
-        (1,  2048): 16.6 - 6.3,   # model weights dominate at B=1
-        (1,  4096): 16.6 - 6.3,
-        (4,  512):  20.0 - 8.0,   # approximate — model + small KV
-        (4,  2048): 25.0 - 10.0,
-        (4,  4096): 30.0 - 12.0,
-        (16, 512):  30.0 - 14.0,
-        (16, 2048): 46.5 - 26.6,
-        (16, 4096): 46.5 - 26.6,
-    }
+    cm = pd.read_csv(COMBINED_MEM_CSV)
+    cm_idx = cm.set_index(["dtype", "batch", "seq_len"])["peak_mem_gb"]
 
     configs, kv_save, w4a8_save = [], [], []
     for N in SEQ_LENS:
         for B in [1, 16]:
-            kv_fp16 = 2 * LAYERS * B * HEADS * N * HEAD_DIM * 2 / 1e9
-            kv_int8 = 2 * LAYERS * B * HEADS * N * HEAD_DIM * 1 / 1e9
+            fp16_mem = cm_idx[("fp16",   B, N)]
+            int8_mem = cm_idx[("int8kv", B, N)]
+            w4a8_mem = cm_idx[("w4a8",   B, N)]
             configs.append(f"B={B}, N={N}")
-            kv_save.append(kv_fp16 - kv_int8)
-            w4a8_save.append(w4a8_savings.get((B, N), 0))
+            kv_save.append(fp16_mem - int8_mem)
+            w4a8_save.append(fp16_mem - w4a8_mem)
 
     x = np.arange(len(configs))
     w = 0.35
@@ -331,6 +325,153 @@ def fig_memory_comparison():
 
 
 # ---------------------------------------------------------------------------
+# Fig 5: Combined experiment — measured peak GPU memory (all 4 configs)
+# ---------------------------------------------------------------------------
+
+def fig_combined_memory():
+    """
+    Line plots of measured peak GPU memory for all 4 configs across N,
+    one subplot per batch size. Directly shows additive composition.
+    """
+    df = pd.read_csv(COMBINED_MEM_CSV)
+
+    dtype_colors = {"fp16": GRAY, "int8kv": BLUE, "w4a8": ORANGE, "combined": GREEN}
+    dtype_labels = {
+        "fp16":     "FP16 baseline",
+        "int8kv":   "INT8 KV cache",
+        "w4a8":     "W4A8 weights",
+        "combined": "W4A8 + INT8KV",
+    }
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=False)
+    for ax, B in zip(axes, [1, 4, 16]):
+        sub = df[df.batch == B]
+        for dtype in ["fp16", "int8kv", "w4a8", "combined"]:
+            grp = sub[sub.dtype == dtype].sort_values("seq_len")
+            ax.plot(grp["seq_len"], grp["peak_mem_gb"], "o-",
+                    color=dtype_colors[dtype], label=dtype_labels[dtype],
+                    linewidth=2, markersize=7)
+        ax.set_title(f"Batch size B={B}", fontsize=11)
+        ax.set_xlabel("Sequence length")
+        ax.set_xticks(SEQ_LENS)
+        ax.yaxis.grid(True, alpha=0.3)
+        if B == 1:
+            ax.set_ylabel("Peak GPU Memory (GB)")
+        if B == 16:
+            ax.legend(loc="upper left", fontsize=9)
+
+    fig.suptitle(
+        "Exp 4: Measured Peak GPU Memory — Qwen3-8B on A100\n"
+        "W4A8 saves static weights (~10.3 GB); INT8KV saves scale with B×N; savings compose additively",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    out = OUT_DIR / "fig_combined_memory.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {out}")
+
+
+# ---------------------------------------------------------------------------
+# Fig 6: Perplexity bar chart with 5% degradation budget
+# ---------------------------------------------------------------------------
+
+def fig_perplexity():
+    import json
+
+    with open(COMBINED_PPL_JSON) as f:
+        ppl = json.load(f)
+
+    order  = ["fp16", "int8kv", "w4a8", "combined"]
+    labels = ["FP16\nbaseline", "INT8\nKV", "W4A8", "W4A8 +\nINT8KV"]
+    values = [ppl[k] for k in order]
+    colors = [GRAY, BLUE, ORANGE, GREEN]
+
+    fp16_ppl    = ppl["fp16"]
+    budget_ppl  = fp16_ppl * 1.05
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bars = ax.bar(labels, values, color=colors, zorder=2, width=0.5)
+
+    ax.axhline(budget_ppl, color=RED, linestyle="--", linewidth=1.5,
+               label=f"5% degradation budget ({budget_ppl:.2f})")
+
+    for bar, val, key in zip(bars, values, order):
+        deg_str = "" if key == "fp16" else f"\n({(val/fp16_ppl - 1)*100:+.1f}%)"
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.03,
+                f"{val:.3f}{deg_str}",
+                ha="center", va="bottom", fontsize=9)
+
+    ax.set_ylabel("Perplexity — WikiText-103 (lower is better)")
+    ax.set_title(
+        "Exp 4: Perplexity — W4A8 + INT8KV vs FP16 Baseline\n"
+        "Combined quantization stays within 5% quality budget",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=9)
+    ax.yaxis.grid(True, alpha=0.3, zorder=0)
+    ax.set_ylim(11.5, 13.8)
+
+    plt.tight_layout()
+    out = OUT_DIR / "fig_perplexity.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {out}")
+
+
+# ---------------------------------------------------------------------------
+# Fig 7: Savings waterfall at B=16 — decomposing W4A8 vs INT8KV contributions
+# ---------------------------------------------------------------------------
+
+def fig_savings_waterfall():
+    """
+    Stacked bar showing how fp16 memory breaks down into:
+      remaining (combined) + INT8KV saved + W4A8 saved
+    at B=16 across all three sequence lengths.
+    """
+    df  = pd.read_csv(COMBINED_MEM_CSV)
+    idx = df.set_index(["dtype", "batch", "seq_len"])["peak_mem_gb"]
+
+    w4a8_save = [idx[("fp16", 16, N)] - idx[("w4a8",   16, N)] for N in SEQ_LENS]
+    kv_save   = [idx[("w4a8", 16, N)] - idx[("combined", 16, N)] for N in SEQ_LENS]
+    remaining = [idx[("combined", 16, N)] for N in SEQ_LENS]
+
+    x = np.arange(len(SEQ_LENS))
+    w = 0.5
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    b_rem  = ax.bar(x, remaining, w, label="Combined remaining",          color=GREEN,  zorder=2)
+    b_kv   = ax.bar(x, kv_save,   w, bottom=remaining,                    label="INT8KV saves (KV cache)", color=ORANGE, zorder=2)
+    b_w4a8 = ax.bar(x, w4a8_save, w,
+                    bottom=[r + k for r, k in zip(remaining, kv_save)],
+                    label="W4A8 saves (weights)", color=BLUE, zorder=2)
+
+    for i, (w4, kv, rem) in enumerate(zip(w4a8_save, kv_save, remaining)):
+        ax.text(i, rem / 2,         f"{rem:.1f} GB",  ha="center", va="center", fontsize=9, color="white", fontweight="bold")
+        ax.text(i, rem + kv / 2,    f"−{kv:.1f} GB",  ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+        ax.text(i, rem + kv + w4/2, f"−{w4:.1f} GB",  ha="center", va="center", fontsize=8, color="white", fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"N={N}" for N in SEQ_LENS])
+    ax.set_ylabel("Peak GPU Memory (GB)")
+    ax.set_title(
+        "Memory Savings Decomposition at B=16 — Qwen3-8B on A100\n"
+        "W4A8 saves a fixed ~10.3 GB (static weights); INT8KV savings grow with sequence length",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(loc="upper left")
+    ax.yaxis.grid(True, alpha=0.3, zorder=0)
+
+    plt.tight_layout()
+    out = OUT_DIR / "fig_savings_waterfall.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {out}")
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 
@@ -340,4 +481,7 @@ if __name__ == "__main__":
     fig_amdahl()
     fig_roofline()
     fig_memory_comparison()
+    fig_combined_memory()
+    fig_perplexity()
+    fig_savings_waterfall()
     print("Done.")

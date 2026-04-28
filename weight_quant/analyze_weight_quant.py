@@ -81,7 +81,7 @@ def plot_bottleneck_shift(df, output_dir):
                         ax.text(bar.get_x() + bar.get_width() / 2,
                                 bar.get_height() + 0.5,
                                 f"{v:.0f}%", ha="center", va="bottom",
-                                fontsize=6.5, color="black")
+                                fontsize=10, color="black")
                 i += 1
 
     _add_batch_dividers(ax, pivot.index, x)
@@ -93,6 +93,8 @@ def plot_bottleneck_shift(df, output_dir):
     ax.set_xticklabels(labels)
     ax.legend(loc="upper left", fontsize=9)
     ax.set_ylim(0, 100)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
     ax.grid(axis="y", alpha=0.3)
     fig.subplots_adjust(bottom=0.18)
 
@@ -132,7 +134,7 @@ def plot_latency(df, output_dir):
                 sign = "+" if change > 0 else ""
                 ax.text(x[idx], taller + taller * 0.02,
                         f"{sign}{change:.1f}%", ha="center", va="bottom",
-                        fontsize=7, fontweight="bold", color=color)
+                        fontsize=11, fontweight="bold", color=color)
 
     _add_batch_dividers(ax, pivot.index, x)
 
@@ -142,6 +144,9 @@ def plot_latency(df, output_dir):
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.legend()
+    ax.set_yscale('log')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
     ax.grid(axis="y", alpha=0.3)
     fig.subplots_adjust(bottom=0.18)
 
@@ -185,7 +190,7 @@ def plot_memory(df, output_dir):
                 sign = "+" if change > 0 else ""
                 ax.text(x[idx], taller + taller * 0.02,
                         f"{sign}{change:.1f}%", ha="center", va="bottom",
-                        fontsize=7, fontweight="bold", color=color)
+                        fontsize=11, fontweight="bold", color=color)
 
     _add_batch_dividers(ax, pivot.index, x)
 
@@ -195,6 +200,8 @@ def plot_memory(df, output_dir):
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.legend()
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
     ax.grid(axis="y", alpha=0.3)
     fig.subplots_adjust(bottom=0.18)
 
